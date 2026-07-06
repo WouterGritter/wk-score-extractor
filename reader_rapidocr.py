@@ -54,17 +54,24 @@ def _alpha_code(text: str) -> str:
 
 class RapidOcrScoreReader(ScoreReader):
     def __init__(self, roi_frac=DEFAULT_ROI_FRAC, upscale: int = 3,
-                 min_conf: float = 0.8):
+                 min_conf: float = 0.8, use_cuda: bool = False):
         self.roi_frac = roi_frac
         self.upscale = upscale
         self.min_conf = min_conf
+        self.use_cuda = use_cuda
         self._engine = None
 
     @property
     def engine(self):
         if self._engine is None:  # lazy: loading models is slow
             from rapidocr_onnxruntime import RapidOCR
-            self._engine = RapidOCR()
+            # use_cuda routes det/cls/rec through onnxruntime's CUDAExecutionProvider.
+            # Requires onnxruntime-gpu (not the bundled CPU onnxruntime) + a CUDA
+            # runtime; otherwise RapidOCR logs a warning and stays on CPU. The first
+            # read after enabling CUDA is slow (10-30s) for cuDNN autotune + upload.
+            self._engine = RapidOCR(det_use_cuda=self.use_cuda,
+                                    cls_use_cuda=self.use_cuda,
+                                    rec_use_cuda=self.use_cuda)
         return self._engine
 
     def _ocr_tokens(self, rgb: np.ndarray) -> list[Token]:

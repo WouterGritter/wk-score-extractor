@@ -38,9 +38,23 @@ def load_dotenv(filename: str = ".env") -> None:
             os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
-def analyze(paths: list[str]) -> None:
+def _truthy(val: str) -> bool:
+    return val.lower() in ("1", "true", "yes", "on")
+
+
+def use_cuda_enabled(args) -> bool:
+    """CUDA on if --cuda is passed or USE_CUDA is truthy in the env/.env."""
+    return bool(args.cuda) or _truthy(os.environ.get("USE_CUDA", ""))
+
+
+def hwaccel_enabled(args) -> bool:
+    """GPU (NVDEC) decode on if --hwaccel is passed or FFMPEG_HWACCEL is truthy."""
+    return bool(args.hwaccel) or _truthy(os.environ.get("FFMPEG_HWACCEL", ""))
+
+
+def analyze(paths: list[str], use_cuda: bool = False) -> None:
     """Dry run: read the score from local image file(s) and print results."""
-    reader = RapidOcrScoreReader()
+    reader = RapidOcrScoreReader(use_cuda=use_cuda)
     for path in paths:
         try:
             print(f"{os.path.basename(path):32s} {reader.read(path)}")
@@ -50,7 +64,8 @@ def analyze(paths: list[str]) -> None:
 
 def run_live(args) -> None:
     url = resolve_url(args.ip, args.channel)
-    reader = RapidOcrScoreReader()
+    reader = RapidOcrScoreReader(use_cuda=use_cuda_enabled(args))
+    hwaccel = hwaccel_enabled(args)
     tracker = ScoreTracker(confirm_k=args.confirm)
     notifier = DiscordNotifier(args.webhook or os.environ.get("DISCORD_WEBHOOK_URL"))
 
@@ -80,11 +95,12 @@ def run_live(args) -> None:
                         log.warning("stream ended — restarting")
                         if grabber:
                             grabber.stop()
-                        grabber = StreamGrabber(url, fps=args.fps).start()
+                        grabber = StreamGrabber(url, fps=args.fps,
+                                                hwaccel=hwaccel).start()
                         last_seq = 0
                     frame, last_seq = grabber.read(timeout=20.0, after_seq=last_seq)
                 else:
-                    frame = grab_frame(url, seek=args.seek)
+                    frame = grab_frame(url, seek=args.seek, hwaccel=hwaccel)
                 result = reader.read(frame)
             except CaptureError as e:
                 log.warning("capture error: %s", e)
@@ -104,7 +120,8 @@ def run_live(args) -> None:
                     active = True
                     last_activity = now
                     last_heartbeat = now
-                    grabber = StreamGrabber(url, fps=args.fps).start()
+                    grabber = StreamGrabber(url, fps=args.fps,
+                                            hwaccel=hwaccel).start()
                     last_seq = 0
                     log.info("scorebug detected -> ACTIVE (persistent stream)")
                 if result.score is not None:
@@ -154,6 +171,11 @@ def main() -> None:
                     help="minutes between ACTIVE heartbeat logs (0 disables)")
     ap.add_argument("--webhook", default=None,
                     help="Discord webhook URL (else env DISCORD_WEBHOOK_URL)")
+    ap.add_argument("--cuda", action="store_true",
+                    help="run OCR on GPU via onnxruntime-gpu (or set USE_CUDA=1)")
+    ap.add_argument("--hwaccel", action="store_true",
+                    help="decode on GPU via NVDEC (or set FFMPEG_HWACCEL=1); "
+                         "needs cuda-enabled ffmpeg + the NVIDIA 'video' capability")
     ap.add_argument("--verbose", action="store_true", help="log every frame read")
     ap.add_argument("--test", action="store_true",
                     help="send a Discord test message and exit")
@@ -177,7 +199,7 @@ def main() -> None:
         log.info("test message %s", "sent" if ok else "NOT sent")
         return
     if args.analyze:
-        analyze(args.analyze)
+        analyze(args.analyze, use_cuda=use_cuda_enabled(args))
         return
     run_live(args)
 

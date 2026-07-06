@@ -128,6 +128,50 @@ Python 3.10, WSL2 Linux. Deps: `pillow numpy rapidocr-onnxruntime` (pip);
 during dev, treat as compromised if repo goes public). Recordings live at
 `/mnt/x/tvrecordings/NOS FIFA WK Voetbal 2026 (2026)/Season 2026/` (network disk).
 
+## GPU / CUDA (prod on the Tesla P4 host)
+
+OCR is the ACTIVE-loop bottleneck (~1–2.5 s/frame on CPU); the GPU path exists to
+cut that. **Code is provider-agnostic:** `RapidOcrScoreReader(use_cuda=...)` just
+sets `det/cls/rec_use_cuda` on RapidOCR, which routes onnxruntime to
+`CUDAExecutionProvider`. `monitor.py` turns it on via `--cuda` **or** `USE_CUDA=1`
+(env/.env). Default is **CPU** — the laptop image and dev flow are untouched.
+
+- **The real work is packaging, not code.** `rapidocr-onnxruntime` bundles CPU
+  `onnxruntime`; the GPU image must `pip uninstall onnxruntime` then install
+  `onnxruntime-gpu` (having both → Python imports the CPU one and silently falls
+  back — RapidOCR only logs a warning, doesn't error). Done in `Dockerfile.gpu`.
+- **`Dockerfile.gpu`** (base `nvidia/cuda:12.4.1-cudnn-runtime` = CUDA 12 + cuDNN 9,
+  what `onnxruntime-gpu==1.23.2` links against) + **`docker-compose.gpu.yml`** (GPU
+  reservation). Deploy: `docker compose -f docker-compose.yml -f
+  docker-compose.gpu.yml up -d --build`. The plain `Dockerfile` stays CPU.
+- **P4 = Pascal (compute 6.1):** works with CUDA 12; host needs driver ≥ 525 and
+  `nvidia-container-toolkit`. Verify with `nvidia-smi` on the host.
+- **The GPU host must reach the HDHomeRun** (`${HDHR_IP}`) on the LAN — capture is
+  unchanged, still pulls the stream directly.
+- **First read after enabling CUDA is slow** (10–30 s: cuDNN autotune + models onto
+  the GPU). One-time — the engine is a lazy singleton.
+
+### CPU usage & the two levers (measured on the P4 VM, GPU OCR on)
+
+`top` showed **ffmpeg ~138%** + **python ~98%** — a saturated 2-vCPU VM. Causes and
+fixes:
+
+- **ffmpeg ~138% = full-rate HEVC decode, not 4 fps.** `-vf fps=4` only throttles
+  the *output*; ffmpeg still decodes every input frame (1080p @ 25–50 fps) before the
+  filter drops them. This is the one place GPU decode genuinely helps (earlier "4 fps
+  decode is trivial" was wrong — the *decode* isn't 4 fps). Fix: **NVDEC** via
+  `--hwaccel` / `FFMPEG_HWACCEL=1` (`_hwaccel_args` prepends `-hwaccel cuda`).
+  Opt-in/off-by-default because it needs a cuda-enabled ffmpeg build **and** the
+  `video` driver capability (`NVIDIA_DRIVER_CAPABILITIES=all`, set in Dockerfile.gpu;
+  compute-only won't expose libnvcuvid). Verify the build first:
+  `docker run --rm --entrypoint ffmpeg <img> -hwaccels` (expect `cuda`).
+- **python ~98% = OCR-ing 4 frames/sec with no throttle.** Even with GPU inference,
+  per-frame CPU work remains (PNG decode, 3× upscale, RapidOCR det post-processing).
+  The ACTIVE loop has no sleep, so it runs as fast as frames arrive. Fix (free, no
+  rebuild): **lower `--fps` to 1–2.** With `confirm x2`, 1 fps confirms a score in
+  ~2 s. This cuts python's rate ~4× and ffmpeg's PNG-encode share, but NOT ffmpeg's
+  decode (that's what NVDEC is for). Do the fps change first, then NVDEC if needed.
+
 ## Future: EPG gating (parked)
 
 Goal: when no football is scheduled, skip OCR entirely and **release the tuner**.

@@ -18,6 +18,18 @@ from PIL import Image
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
 
+def _hwaccel_args(hwaccel: bool) -> list[str]:
+    """Pre-input flags to decode on the GPU (NVDEC) instead of the CPU.
+
+    `-hwaccel cuda` offloads HEVC decode to the GPU and auto-downloads frames to
+    system memory, so the fps filter + PNG encode downstream are unchanged. Needs
+    an ffmpeg built with cuda/cuvid AND the container's NVIDIA `video` driver
+    capability (compute-only won't expose libnvcuvid). If unsupported, ffmpeg
+    errors on open — hence this is opt-in, not the default.
+    """
+    return ["-hwaccel", "cuda"] if hwaccel else []
+
+
 class CaptureError(RuntimeError):
     pass
 
@@ -53,7 +65,8 @@ def _read_png(stream) -> bytes | None:
 
 
 def grab_frame(url: str, seek: float = 2.0, timeout: float = 40.0,
-               loglevel: str = "error", probesize: int = 500000) -> Image.Image:
+               loglevel: str = "error", probesize: int = 500000,
+               hwaccel: bool = False) -> Image.Image:
     """Return one RGB frame from `url` (~4 s on the live feed).
 
     `-analyzeduration 0` cuts ffmpeg's stream analysis (open ~9 s -> ~2 s); `seek`
@@ -64,7 +77,7 @@ def grab_frame(url: str, seek: float = 2.0, timeout: float = 40.0,
     os.close(fd)
     cmd = ["ffmpeg", "-nostdin", "-loglevel", loglevel, "-y",
            "-probesize", str(probesize), "-analyzeduration", "0",
-           "-fflags", "nobuffer", "-i", url]
+           "-fflags", "nobuffer", *_hwaccel_args(hwaccel), "-i", url]
     if seek > 0:
         cmd += ["-ss", str(seek)]
     cmd += ["-frames:v", "1", "-q:v", "2", path]
@@ -95,11 +108,12 @@ class StreamGrabber:
     """
 
     def __init__(self, url: str, fps: int = 4, loglevel: str = "error",
-                 probesize: int = 500000):
+                 probesize: int = 500000, hwaccel: bool = False):
         self.url = url
         self.fps = fps
         self.loglevel = loglevel
         self.probesize = probesize
+        self.hwaccel = hwaccel
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -110,7 +124,7 @@ class StreamGrabber:
     def start(self) -> "StreamGrabber":
         cmd = ["ffmpeg", "-nostdin", "-loglevel", self.loglevel,
                "-probesize", str(self.probesize), "-analyzeduration", "0",
-               "-fflags", "nobuffer", "-i", self.url,
+               "-fflags", "nobuffer", *_hwaccel_args(self.hwaccel), "-i", self.url,
                "-an", "-vf", f"fps={self.fps}",
                "-f", "image2pipe", "-c:v", "png", "pipe:1"]
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
