@@ -38,6 +38,17 @@ python3 monitor.py --analyze /path/to/frame.png     # dry run, no capture
 Console logs + a Discord message fire on the first score seen (e.g. 0-0) and on
 every goal. `--verbose` logs every frame read.
 
+#### Docker
+
+```bash
+cp .env.example .env            # set DISCORD_WEBHOOK_URL (and optionally HDHR_IP / CHANNEL)
+docker compose up -d --build    # runs 24/7, restarts unless stopped
+docker compose logs -f          # follow events
+```
+
+`.env` supplies the webhook and (optionally) `HDHR_IP` / `CHANNEL`, which the
+compose `command` passes to the monitor.
+
 ### Polling (CPU-friendly for 24/7)
 
 * **IDLE** — nothing on screen: one ffmpeg grab per `--interval` s (default 60),
