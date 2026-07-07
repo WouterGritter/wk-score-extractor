@@ -49,17 +49,20 @@ docker compose logs -f          # follow events
 `.env` supplies the webhook and (optionally) `HDHR_IP` / `CHANNEL`, which the
 compose `command` passes to the monitor.
 
-**GPU (NVIDIA):** to run OCR on the GPU, use the GPU image, which needs the
-NVIDIA driver + `nvidia-container-toolkit` on the host (and that host must reach
-the HDHomeRun on the LAN):
+The **default** image (`Dockerfile` / `docker-compose.yml`) is the GPU build:
+CUDA 12 + `onnxruntime-gpu`, `USE_CUDA=1`. It needs the NVIDIA driver +
+`nvidia-container-toolkit` on the host (and that host must reach the HDHomeRun on
+the LAN). Outside Docker, pass `--cuda` (or set `USE_CUDA=1`) with
+`onnxruntime-gpu` installed.
+
+**CPU-only (e.g. the laptop):** use the CPU image, which has no GPU
+requirements:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+docker compose -f docker-compose.cpu.yml up -d --build
 ```
 
-This builds `Dockerfile.gpu` (CUDA 12 + `onnxruntime-gpu`) and sets `USE_CUDA=1`.
-Outside Docker, pass `--cuda` (or set `USE_CUDA=1`) with `onnxruntime-gpu`
-installed. The default CPU image is unchanged.
+This builds `Dockerfile.cpu` (plain `onnxruntime`, no CUDA).
 
 ### Polling (CPU-friendly for 24/7)
 

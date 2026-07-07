@@ -134,16 +134,19 @@ OCR is the ACTIVE-loop bottleneck (~1–2.5 s/frame on CPU); the GPU path exists
 cut that. **Code is provider-agnostic:** `RapidOcrScoreReader(use_cuda=...)` just
 sets `det/cls/rec_use_cuda` on RapidOCR, which routes onnxruntime to
 `CUDAExecutionProvider`. `monitor.py` turns it on via `--cuda` **or** `USE_CUDA=1`
-(env/.env). Default is **CPU** — the laptop image and dev flow are untouched.
+(env/.env). Outside Docker the code default is **CPU**; the default Docker image
+now bakes `USE_CUDA=1` (GPU is the default deployment — see below). The CPU dev
+flow (`--analyze`, `--once`, etc.) is untouched.
 
 - **The real work is packaging, not code.** `rapidocr-onnxruntime` bundles CPU
   `onnxruntime`; the GPU image must `pip uninstall onnxruntime` then install
   `onnxruntime-gpu` (having both → Python imports the CPU one and silently falls
-  back — RapidOCR only logs a warning, doesn't error). Done in `Dockerfile.gpu`.
-- **`Dockerfile.gpu`** (base `nvidia/cuda:12.4.1-cudnn-runtime` = CUDA 12 + cuDNN 9,
-  what `onnxruntime-gpu==1.23.2` links against) + **`docker-compose.gpu.yml`** (GPU
-  reservation). Deploy: `docker compose -f docker-compose.yml -f
-  docker-compose.gpu.yml up -d --build`. The plain `Dockerfile` stays CPU.
+  back — RapidOCR only logs a warning, doesn't error). Done in the default `Dockerfile`.
+- **Default image is GPU.** `Dockerfile` (base `nvidia/cuda:12.4.1-cudnn-runtime`
+  = CUDA 12 + cuDNN 9, what `onnxruntime-gpu==1.23.2` links against) +
+  `docker-compose.yml` (GPU reservation, `USE_CUDA=1`). Deploy: `docker compose up
+  -d --build`. The **CPU-only** variant is `Dockerfile.cpu` + `docker-compose.cpu.yml`
+  (plain `onnxruntime`): `docker compose -f docker-compose.cpu.yml up -d --build`.
 - **P4 = Pascal (compute 6.1):** works with CUDA 12; host needs driver ≥ 525 and
   `nvidia-container-toolkit`. Verify with `nvidia-smi` on the host.
 - **The GPU host must reach the HDHomeRun** (`${HDHR_IP}`) on the LAN — capture is
@@ -162,7 +165,7 @@ fixes:
   decode is trivial" was wrong — the *decode* isn't 4 fps). Fix: **NVDEC** via
   `--hwaccel` / `FFMPEG_HWACCEL=1` (`_hwaccel_args` prepends `-hwaccel cuda`).
   Opt-in/off-by-default because it needs a cuda-enabled ffmpeg build **and** the
-  `video` driver capability (`NVIDIA_DRIVER_CAPABILITIES=all`, set in Dockerfile.gpu;
+  `video` driver capability (`NVIDIA_DRIVER_CAPABILITIES=all`, set in the default Dockerfile;
   compute-only won't expose libnvcuvid). Verify the build first:
   `docker run --rm --entrypoint ffmpeg <img> -hwaccels` (expect `cuda`).
 - **python ~98% = OCR-ing 4 frames/sec with no throttle.** Even with GPU inference,

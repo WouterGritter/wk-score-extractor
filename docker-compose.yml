@@ -1,3 +1,8 @@
+# Default (GPU) deployment for the prod host:
+#   docker compose up -d --build
+# Requires the NVIDIA driver + nvidia-container-toolkit on the host. This host
+# must also be able to reach the HDHomeRun at ${HDHR_IP} on the LAN.
+# For a CPU-only box, use docker-compose.cpu.yml instead.
 services:
   monitor:
     build: .
@@ -8,6 +13,20 @@ services:
     # container. Copy .env.example to .env first.
     env_file: .env
     command: ["--ip", "${HDHR_IP:-10.43.70.192}", "--channel", "${CHANNEL:-1}"]
+    # USE_CUDA=1 is baked into the Dockerfile; set here too for clarity/override.
+    # NVIDIA_DRIVER_CAPABILITIES=all exposes libnvcuvid so optional NVDEC decode
+    # (--hwaccel / FFMPEG_HWACCEL=1) can find it — compute+utility alone won't.
+    environment:
+      USE_CUDA: "1"
+      NVIDIA_DRIVER_CAPABILITIES: all
+    # Reserve all GPUs (equivalent to `docker run --gpus all`).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     # The HDHomeRun is on the LAN; default bridge networking reaches it fine.
     # For lower overhead on the continuous stream, use host networking instead:
     # network_mode: host

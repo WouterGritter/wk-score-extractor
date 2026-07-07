@@ -1,0 +1,19 @@
+# CPU-only deployment (e.g. the laptop) — no GPU required:
+#   docker compose -f docker-compose.cpu.yml up -d --build
+# The default docker-compose.yml is the GPU build; use this one on hosts without
+# an NVIDIA GPU.
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: wk-score-extractor:cpu
+    container_name: wk-score-extractor
+    restart: unless-stopped
+    # Loads DISCORD_WEBHOOK_URL (and optionally HDHR_IP / CHANNEL) into the
+    # container. Copy .env.example to .env first.
+    env_file: .env
+    command: ["--ip", "${HDHR_IP:-10.43.70.192}", "--channel", "${CHANNEL:-1}"]
+    # The HDHomeRun is on the LAN; default bridge networking reaches it fine.
+    # For lower overhead on the continuous stream, use host networking instead:
+    # network_mode: host
