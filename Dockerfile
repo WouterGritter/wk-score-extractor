@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip uninstall -y onnxruntime \
     && pip install --no-cache-dir onnxruntime-gpu==1.23.2
 
-COPY *.py ./
+COPY *.py teams.json ./
 
 # Unbuffered stdout so `docker logs` shows events promptly; USE_CUDA flips the
 # reader onto the GPU (monitor.py reads it; equivalent to passing --cuda).

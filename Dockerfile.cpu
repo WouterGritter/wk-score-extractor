@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py ./
+COPY *.py teams.json ./
 
 # Unbuffered stdout so `docker logs` shows events promptly.
 ENV PYTHONUNBUFFERED=1
