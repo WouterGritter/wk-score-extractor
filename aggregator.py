@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from score_reader import ScoreResult
+from teams import canonical_code, name as team_name
 
 
 @dataclass
@@ -45,13 +46,13 @@ class ScoreEvent:
 
 
 def format_event(e: ScoreEvent) -> str:
-    ht = e.home_team or "Home"
-    at = e.away_team or "Away"
+    ht = team_name(e.home_team) or "Home"
+    at = team_name(e.away_team) or "Away"
     line = f"{ht} {e.home}-{e.away} {at}"
     clock = f"  ({e.clock})" if e.clock else ""
     if e.is_first:
         return f"▶️  {line}{clock}"
-    scorer = e.scorer
+    scorer = team_name(e.scorer)
     if scorer:
         return f"⚽  GOAL {scorer}!  {line}{clock}"
     return f"⚽  GOAL!  {line}{clock}"
@@ -86,13 +87,17 @@ class ScoreTracker:
         # mid-transition frame whose digits aren't trustworthy (e.g. "9-0 ?-ESP").
         if self.require_both_teams and not (r.home_team and r.away_team):
             return None
+        # Snap noisy OCR codes to known FIFA codes (e.g. OSA->USA) before they
+        # enter the confirm signature; otherwise an OSA/USA flip never confirms.
+        ht = canonical_code(r.home_team)
+        at = canonical_code(r.away_team)
         s = r.score
         total = s[0] + s[1]
 
         # New-match detection: teams changed and the total dropped.
-        if (self.confirmed is not None and r.home_team and r.away_team
+        if (self.confirmed is not None and ht and at
                 and self.match_teams is not None
-                and (r.home_team, r.away_team) != self.match_teams
+                and (ht, at) != self.match_teams
                 and total < self.confirmed[0] + self.confirmed[1]):
             self.reset()
 
@@ -109,7 +114,7 @@ class ScoreTracker:
         # full (score, home_team, away_team) signature: a goal animation briefly
         # misreads a team code, so requiring the teams to be stable too keeps that
         # transient out of the emitted event.
-        cand = (s, r.home_team, r.away_team)
+        cand = (s, ht, at)
         if cand == self._candidate:
             self._candidate_count += 1
         else:

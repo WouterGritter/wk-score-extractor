@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import time
 
+from teams import name as team_name
+
 log = logging.getLogger(__name__)
 
 
@@ -72,10 +74,10 @@ def encode_clip(concat_file: str, out_path: str, *, height: int = 720,
 
 
 def _caption(event) -> str:
-    ht = event.home_team or "Home"
-    at = event.away_team or "Away"
+    ht = team_name(event.home_team) or "Home"
+    at = team_name(event.away_team) or "Away"
     scorer = event.scorer
-    who = f" — {scorer}" if scorer and scorer not in ("home", "away") else ""
+    who = f" — {team_name(scorer)}" if scorer and scorer not in ("home", "away") else ""
     return f"🎥 Replay{who}: {ht} {event.home}-{event.away} {at}"
 
 

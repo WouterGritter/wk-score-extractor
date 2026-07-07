@@ -32,6 +32,7 @@ HDHomeRun ──ffmpeg──> frame ──ScoreReader──> ScoreResult ──S
 | `capture.py` | `grab_frame` (one-shot) + `StreamGrabber` (persistent). |
 | `hdhomerun.py` | Lineup discovery, channel→URL resolution (stdlib urllib). |
 | `aggregator.py` | `ScoreTracker` temporal state machine + `format_event`. |
+| `teams.py` / `teams.json` | Canonicalise noisy OCR codes (Levenshtein) + code→full-name map (all 48 WC 2026 teams). |
 | `notifier.py` | Discord webhook POST + multipart file upload (stdlib). |
 | `clipper.py` | Cut a goal replay from the ring buffer → re-encode → upload. |
 | `monitor.py` | CLI, `.env` load, IDLE/ACTIVE polling loop, `--analyze`/`--test`. |
@@ -125,8 +126,16 @@ it on the 30-min match-end timeout). Scorer = whichever side's count rose.
 
 - **VAR/downward corrections** are ignored (monotonic rule) — accepted trade vs
   the far-more-common halftime replays.
-- **Team codes are best-effort** display text; e.g. Canada's possession dot makes
-  `CAN` read as `OCA`. Never affects the score (digits are separate).
+- **Team codes are canonicalised, then best-effort.** `ScoreTracker.update`
+  snaps each raw OCR code to the nearest known FIFA code within Levenshtein
+  distance 2 (`teams.canonical_code`) *before* it enters the confirm signature —
+  so `USA`→`OSA` blips (~40%) and `CAN`→`OCA` (possession dot) both resolve to the
+  right team, and a flip like `USA`/`OSA` no longer defeats confirm-K. `format_event`
+  and the clip caption then map the code to a full name (`teams.json`, e.g. `USA`→
+  "United States"). Gotcha: nearest-neighbour on a dense 3-letter space can mis-snap
+  a *stray* read (e.g. `OUS`→`AUS`, closer than `USA`), but that only reaches the
+  message if it's the **stable/confirmed** read — a transient mis-snap just fails to
+  accumulate confirm-K. Never affects the score (digits are separate).
 - Assumes the NOS/FIFA-WC scorebug style; a different broadcaster would need the
   parser revisited (but not the color, since it's structural).
 
