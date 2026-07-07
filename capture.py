@@ -102,6 +102,58 @@ def grab_frame(url: str, seek: float = 2.0, timeout: float = 40.0,
             os.remove(path)
 
 
+def grab_frames_at(path: str, t: float, count: int = 3, fps: float = 2.0,
+                   timeout: float = 40.0, loglevel: str = "error") -> list[Image.Image]:
+    """Return up to `count` RGB frames sampled near `t` seconds into a local file.
+
+    Uses **input seeking** (`-ss` before `-i`): ffmpeg jumps to the keyframe near
+    `t` and decodes only a small chunk, so this is fast even on a 30 GB `.ts`
+    (unlike `grab_frame`'s post-input `-ss`, which decodes from the start). The
+    `fps` filter spaces the frames out (e.g. fps=2 -> ~0.5 s apart) so a probe
+    spans a short window rather than three near-identical native-rate frames —
+    that spread is what lets an offline probe tolerate a single replay/blip frame.
+
+    Input seeking lands on a clean keyframe, so no gray-frame skip is needed here
+    (that was a live fast-open artifact, not a seek-into-file one).
+    """
+    tmpdir = tempfile.mkdtemp(prefix="probe-")
+    pattern = os.path.join(tmpdir, "f_%03d.png")
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", loglevel, "-y",
+           "-ss", f"{max(0.0, t):.3f}", "-i", path,
+           "-vf", f"fps={fps}", "-frames:v", str(count), "-q:v", "2", pattern]
+    try:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout)
+        if proc.returncode != 0:
+            raise CaptureError(
+                f"ffmpeg failed (rc={proc.returncode}): "
+                f"{proc.stderr.decode(errors='replace').strip()[-300:]}")
+        frames = []
+        for p in sorted(glob.glob(os.path.join(tmpdir, "f_*.png"))):
+            img = Image.open(p)
+            img.load()
+            frames.append(img.convert("RGB"))
+        return frames
+    except subprocess.TimeoutExpired:
+        raise CaptureError(f"frame probe timed out after {timeout}s")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def probe_duration(path: str, timeout: float = 30.0) -> float:
+    """Container duration in seconds via ffprobe (0.0 if unavailable)."""
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=nokey=1:noprint_wrappers=1", path]
+    try:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout)
+        return float(proc.stdout.decode().strip())
+    except (subprocess.SubprocessError, ValueError):
+        return 0.0
+
+
 class StreamGrabber:
     """Keeps one ffmpeg tuned and serves the latest decoded frame on demand.
 

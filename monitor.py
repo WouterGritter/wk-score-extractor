@@ -21,6 +21,7 @@ from capture import CaptureError, StreamGrabber, grab_frame
 from clipper import build_and_send_clip
 from hdhomerun import resolve_url
 from notifier import DiscordNotifier
+from offline import extract_goals
 from reader_rapidocr import RapidOcrScoreReader
 
 log = logging.getLogger("monitor")
@@ -100,6 +101,7 @@ def run_live(args) -> None:
     clip_max_bytes = int(float(_env_or("CLIP_MAX_MB", args.clip_max_mb)) * 1024 * 1024)
     clip_nvenc = clip_nvenc_enabled(args)
     buffer_dir = _env_or("CLIP_BUFFER_DIR", args.clip_buffer_dir)
+    goals_dir = _env_or("GOALS_DIR", args.goals_dir)
 
     grabber_kwargs = {"fps": args.fps, "hwaccel": hwaccel}
     if clips:
@@ -108,8 +110,8 @@ def run_live(args) -> None:
         # segment_wrap overwriting the segments a snapshot is copying out.
         grabber_kwargs["buffer_seconds"] = clip_seconds * 3
         log.info("goal clips ON: last %.0fs, +%.0fs post-roll, %dp @%s, "
-                 "nvenc=%s, buffer=%s", clip_seconds, clip_postroll,
-                 clip_height, clip_bitrate, clip_nvenc, buffer_dir)
+                 "nvenc=%s, buffer=%s, save=%s", clip_seconds, clip_postroll,
+                 clip_height, clip_bitrate, clip_nvenc, buffer_dir, goals_dir)
 
     active = False
     last_activity = 0.0
@@ -163,7 +165,8 @@ def run_live(args) -> None:
                                         height=clip_height,
                                         vbitrate=(None if clip_bitrate in ("", "auto")
                                                   else clip_bitrate),
-                                        nvenc=clip_nvenc, max_bytes=clip_max_bytes),
+                                        nvenc=clip_nvenc, max_bytes=clip_max_bytes,
+                                        save_dir=goals_dir),
                             daemon=True).start()
 
                 now = time.monotonic()
@@ -200,6 +203,28 @@ def run_live(args) -> None:
     finally:
         if grabber:
             grabber.stop()
+
+
+def run_offline(args) -> None:
+    """Process a pre-recorded .ts: find every goal with minimal OCR and write a
+    replay clip per goal to --goals-dir. No Discord."""
+    reader = RapidOcrScoreReader(use_cuda=use_cuda_enabled(args))
+    goals_dir = _env_or("GOALS_DIR", args.goals_dir)
+    pre = float(_env_or("CLIP_SECONDS", args.clip_seconds))
+    post = float(_env_or("CLIP_POSTROLL", args.clip_postroll))
+    height = int(_env_or("CLIP_HEIGHT", args.clip_height))
+    bitrate = str(_env_or("CLIP_BITRATE", args.clip_bitrate))
+    max_bytes = int(float(_env_or("CLIP_MAX_MB", args.clip_max_mb)) * 1024 * 1024)
+
+    log.info("Offline: %s -> %s (grid %.0fs, %d frames/probe)", args.offline,
+             goals_dir, args.grid_seconds, args.probe_frames)
+    n = extract_goals(
+        args.offline, reader, goals_dir,
+        grid_seconds=args.grid_seconds, probe_frames=args.probe_frames,
+        pre=pre, post=post, height=height,
+        vbitrate=(None if bitrate in ("", "auto") else bitrate),
+        max_bytes=max_bytes, nvenc=clip_nvenc_enabled(args))
+    log.info("Offline done: %d goal clip(s) in %s", n, goals_dir)
 
 
 def main() -> None:
@@ -246,6 +271,17 @@ def main() -> None:
     ap.add_argument("--clip-buffer-dir", default="/dev/shm/wk-score-buffer",
                     help="ring-buffer dir for replay segments; put it on a tmpfs "
                          "(default /dev/shm/wk-score-buffer)")
+    ap.add_argument("--goals-dir", default="./goals",
+                    help="folder for saved goal clips; live goals are saved here "
+                         "in addition to Discord, offline writes here (default ./goals)")
+    ap.add_argument("--offline", metavar="INPUT.ts", default=None,
+                    help="process a pre-recorded stream: find every goal with "
+                         "minimal OCR and write a clip per goal to --goals-dir "
+                         "(no Discord)")
+    ap.add_argument("--grid-seconds", type=float, default=120.0,
+                    help="offline: seconds between coarse grid probes (default 120)")
+    ap.add_argument("--probe-frames", type=int, default=3,
+                    help="offline: frames OCR'd per probe for robustness (default 3)")
     ap.add_argument("--verbose", action="store_true", help="log every frame read")
     ap.add_argument("--test", action="store_true",
                     help="send a Discord test message and exit")
@@ -270,6 +306,9 @@ def main() -> None:
         return
     if args.analyze:
         analyze(args.analyze, use_cuda=use_cuda_enabled(args))
+        return
+    if args.offline:
+        run_offline(args)
         return
     run_live(args)
 

@@ -34,8 +34,9 @@ HDHomeRun ──ffmpeg──> frame ──ScoreReader──> ScoreResult ──S
 | `aggregator.py` | `ScoreTracker` temporal state machine + `format_event`. |
 | `teams.py` / `teams.json` | Canonicalise noisy OCR codes (Levenshtein) + code→full-name map (all 48 WC 2026 teams). |
 | `notifier.py` | Discord webhook POST + multipart file upload (stdlib). |
-| `clipper.py` | Cut a goal replay from the ring buffer → re-encode → upload. |
-| `monitor.py` | CLI, `.env` load, IDLE/ACTIVE polling loop, `--analyze`/`--test`. |
+| `clipper.py` | Cut a goal replay (ring buffer or file range) → re-encode → upload/save. |
+| `offline.py` | Offline goal search on a recorded `.ts`: grid scan + binary-search refine → clip per goal. |
+| `monitor.py` | CLI, `.env` load, IDLE/ACTIVE polling loop, `--analyze`/`--test`/`--offline`. |
 
 ## Key decisions & why
 
@@ -241,6 +242,69 @@ before detection + 5 s post-roll) at 720p.
 - **Upload is stdlib multipart** (`DiscordNotifier.send_file`): a `payload_json`
   field + the file as `files[0]`. It skips (warns, doesn't send) if the file is
   over `max_bytes`, so a mis-sized clip can't 413.
+
+## Offline extraction (`offline.py`)
+
+`monitor.py --offline INPUT.ts` finds every goal in a recording and writes a clip
+per goal to `--goals-dir` (default `./goals`) — no Discord, no HDHomeRun. The
+point is **minimal OCR**: a full 4 fps scan of a 2.5 h match is tens of thousands
+of reads; this does ~tens.
+
+- **Why not naive binary search.** The *true* score is a monotonic staircase, but
+  the *read* score is NOT globally monotonic: halftime highlights re-show old,
+  lower scores, and the scorebug is absent during replays/studio. Pure recursive
+  binary search prunes an interval when its endpoints read equal — a replay dip
+  or a blank frame at an endpoint would silently drop a real goal. So it's a
+  **hybrid**, and it leans on the same monotonic-running-max idea as `ScoreTracker`.
+- **Phase 1 — coarse grid.** Probe once per `--grid-seconds` (default 120). Each
+  probe (`probe()`) reads `--probe-frames` (default 3) frames spread over ~1.5 s
+  via `capture.grab_frames_at` (input seeking, fast on a 30 GB file), keeps reads
+  with a score **and both team codes** (canonicalised), and returns the
+  most-supported score. A rising total that **persists** across probes becomes a
+  confirmed goal; replays read *below* the running max and are ignored for free.
+- **Phase 2 — binary-search refine.** For each grid interval where the total
+  rose, `_search_boundary` binary-searches the goal instant *per goal* (a
+  multi-goal interval is split by searching target totals `from+1..to`). Inside
+  one ~grid_seconds window the score is locally monotonic, so this is safe; it
+  pins each goal to `precision` (2 s) — the **first instant the new score is on
+  screen, i.e. the same anchor the live path uses**, so the same `[−CLIP_SECONDS,
+  +CLIP_POSTROLL]` (25/5) window catches the goal exactly as live does.
+- **THE other gotcha — don't bail on an unreadable midpoint.** A goal celebration
+  animates the scorebug *out* (and brief replays blank it), so a probe landing
+  exactly on the transition often reads `None`. The first version *broke* out of
+  the search on `None` and returned the interval's upper bound `hi` — which is a
+  **coarse grid point**, up to a whole `grid_seconds` after the real update. Tell:
+  every detected goal time came out as an exact multiple of the grid, and the
+  clips sat 0–150 s *after* the goal (only the one goal whose midpoints were all
+  readable refined correctly). Fix: `_resolve` reads a `None` midpoint via the
+  nearest readable frame within ±`reach` (30 s) — a celebration gap or replay no
+  longer aborts the search; it only gives up on a genuine long blackout (deep
+  halftime), which can't contain a rise to a not-yet-scored total anyway.
+- **THE gotcha — the final goal is fragile.** `_persists` normally requires a
+  higher total to appear in ≥ `min_persist` (2) grid probes, to reject a one-off
+  high blip. But the *last* goal of a match is legitimately seen once: the
+  scorebug vanishes into studio analysis right after, so every later probe is
+  `None`. First validation run on NED-SWE dropped the `4-1 → 5-1` because 5-1 hit
+  only the last readable probe. Fix: `_persists` also accepts when **fewer than
+  `min_persist` valid probes remain at all** — can't require more corroboration
+  than exists, and near the end the only way to read a *higher* total is a real
+  goal (replays read lower). Intermediate goals are unaffected: their successors
+  read `>= total` (a later higher score still satisfies persistence), so only the
+  terminal goal ever hits this branch.
+- **Whole-probe misreads ≈ never**, which is why `min_persist` can be this loose:
+  digits read ~100% and each probe already needs 3 frames to agree, so a probe
+  reporting a spurious rise essentially doesn't happen. Team-code blips don't
+  change the total.
+- **Clips need no ring buffer** — the file has random access, so `clipper.encode_range`
+  cuts `[goal − CLIP_SECONDS, goal + CLIP_POSTROLL]` straight from the source with
+  input seeking + the same 720p/`auto_bitrates` path as live. Naming +
+  save-to-disk is the shared `clipper.save_clip` (also used by the live path now).
+- **Live now saves too.** `build_and_send_clip(..., save_dir=)` copies the encoded
+  mp4 into `--goals-dir` before the temp dir is removed, in addition to the
+  Discord upload — so live and offline share one local archive + naming scheme.
+- **Cost knobs:** `--grid-seconds` (denser = safer, more OCR), `--probe-frames`
+  (more = more robust per probe, more OCR), `--cuda` (GPU OCR). On CPU a probe is
+  ~5-6 s, so a 2.5 h match at grid 150 is ~7-10 min end to end.
 
 ## Future: EPG gating (parked)
 

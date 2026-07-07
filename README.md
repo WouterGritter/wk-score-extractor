@@ -22,7 +22,13 @@ from an HDHomeRun) and send a Discord message when the score changes.
 - [x] **Goal-replay clips** — `clipper.py`: on each goal, cut ~30 s (25 s before
   + 5 s after) from an in-RAM ring buffer (same tuner, stream-copied — no extra
   decode), re-encode to 720p, and post it to Discord as a follow-up video.
-  Validated live on NPO 1.
+  Validated live on NPO 1. Live goals are now also **saved to `./goals`** (in
+  addition to Discord).
+- [x] **Offline extraction** — `offline.py`: point it at a pre-recorded `.ts`,
+  and it finds every goal with a coarse grid scan + binary-search refine (~tens
+  of OCR calls, not tens of thousands) and writes a clip per goal to `./goals` —
+  no Discord. Validated on NED–SWE: all 6 goals of the 5-1 found (~55 OCR
+  probes for a 2.5 h match), each clipped as a 720p H.264/AAC mp4.
 - [ ] EPG gating (skip OCR / release tuner when no football is scheduled) —
   *parked*; the IDLE 1-min baseline always runs for now.
 
@@ -37,6 +43,7 @@ cp .env.example .env                                # then edit in your webhook
 python3 monitor.py --ip 10.43.70.192 --channel 1    # live, 24/7
 python3 monitor.py --test                           # send a Discord test message
 python3 monitor.py --analyze /path/to/frame.png     # dry run, no capture
+python3 monitor.py --offline /path/to/match.ts      # find every goal, clip to ./goals
 ```
 
 Console logs + a Discord message fire on the first score seen (e.g. 0-0) and on
@@ -96,6 +103,45 @@ so Discord shows an inline player), and uploads it off the OCR thread.
 Discord's non-boosted cap; raise to 25/100 on a boosted server) so the clip always
 fits. `--clip-nvenc` (or `CLIP_NVENC=1`) encodes on the GPU. Both compose files
 **enable clips by default** and mount the tmpfs; see `.env.example` for all knobs.
+
+Every clip a live goal produces is also written to `--goals-dir` (default
+`./goals`) under a descriptive name — so you keep a local archive as well as the
+Discord post.
+
+### Offline extraction (pre-recorded matches)
+
+Point `--offline` at a recorded `.ts` and it finds every goal and writes a clip
+per goal to `--goals-dir` (default `./goals`) — no Discord, no HDHomeRun:
+
+```bash
+python3 monitor.py --offline "/path/to/match.ts"                 # -> ./goals/*.mp4
+python3 monitor.py --offline "match.ts" --goals-dir /tmp/out     # elsewhere
+python3 monitor.py --offline "match.ts" --grid-seconds 90 --cuda # denser + GPU OCR
+```
+
+A full-frame scan would be tens of thousands of OCR calls. Instead it uses that
+the *true* score is a monotonic staircase in match time:
+
+1. **Coarse grid** — probe the score once per `--grid-seconds` (default 120).
+   Each probe reads `--probe-frames` (default 3) frames near a timestamp and
+   takes the agreed read, so one replay/blank frame can't fool it. A rising total
+   that *persists* becomes a confirmed goal; halftime replays read *lower* and
+   fall below the running max, so they're ignored for free.
+2. **Binary-search refine** — for each grid interval where the score rose,
+   binary-search the exact goal instant (per goal, so a multi-goal interval is
+   split). Inside one interval the score is locally monotonic, so this is safe
+   and pins each goal to a few seconds.
+
+That's ~tens of OCR calls for a whole match. Each clip is framed as
+`[goal − --clip-seconds, goal + --clip-postroll]` cut straight from the file
+(random access — no ring buffer), re-encoded with the same 720p/bitrate knobs as
+live. Clips are named e.g. `2026-06-20_211500_NED-SWE_4-1_Sweden_61-01.mp4`
+(broadcast date, teams, resulting score, scorer, match clock).
+
+**Caveats** (same trade-offs as live): VAR/downward corrections are ignored
+(monotonic rule); a goal whose entire grid interval is masked by a replay/blackout
+could be missed — mitigated by a denser `--grid-seconds` and more `--probe-frames`
+(both cost more OCR).
 
 ### HDHomeRun
 
@@ -161,8 +207,9 @@ screen (e.g. 1-0 @05:08 at real-time 66 min), and `aggregator.py` filters it out
 | `hdhomerun.py` | Discover channels / resolve stream URLs |
 | `aggregator.py` | Temporal state machine: confirmed score changes |
 | `notifier.py` | Discord webhook sender (messages + file uploads) |
-| `clipper.py` | Goal-replay clip: snapshot ring buffer → re-encode → upload |
-| `monitor.py` | Live poll loop + `--analyze` dry run; logs + notifies |
+| `clipper.py` | Goal-replay clip: snapshot ring buffer / cut range → re-encode → upload / save |
+| `offline.py` | Offline goal search on a recorded `.ts`: grid scan + binary-search refine → clip per goal |
+| `monitor.py` | Live poll loop + `--analyze` dry run + `--offline`; logs + notifies |
 
 ### Extracting test frames from a recording (fast, no full read)
 
