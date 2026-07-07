@@ -6,8 +6,11 @@
 """
 from __future__ import annotations
 
+import glob
 import io
+import math
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -105,15 +108,28 @@ class StreamGrabber:
     A background thread drains complete PNG frames from ffmpeg's pipe (keeping
     only the newest), so `read()` never blocks on decode, never returns a
     half-written frame, and never lags behind real time.
+
+    With `buffer_dir` set, the *same* ffmpeg also stream-copies the source into a
+    rolling ring of keyframe-aligned `.ts` segments — one tuner, no extra decode
+    (the copy path re-muxes packets), so a goal replay can be cut from the last
+    N seconds on demand (`snapshot`). Put `buffer_dir` on a tmpfs to keep the
+    ring entirely in RAM.
     """
 
     def __init__(self, url: str, fps: int = 4, loglevel: str = "error",
-                 probesize: int = 500000, hwaccel: bool = False):
+                 probesize: int = 500000, hwaccel: bool = False,
+                 buffer_dir: str | None = None, buffer_seconds: float = 270.0,
+                 segment_time: float = 2.0):
         self.url = url
         self.fps = fps
         self.loglevel = loglevel
         self.probesize = probesize
         self.hwaccel = hwaccel
+        self.buffer_dir = buffer_dir
+        self.segment_time = segment_time
+        # Ring length in filenames; segment_wrap reuses them cyclically so the
+        # footprint is bounded to ~buffer_seconds of stream regardless of runtime.
+        self._segment_wrap = max(2, math.ceil(buffer_seconds / segment_time))
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -125,14 +141,82 @@ class StreamGrabber:
         cmd = ["ffmpeg", "-nostdin", "-loglevel", self.loglevel,
                "-probesize", str(self.probesize), "-analyzeduration", "0",
                "-fflags", "nobuffer", *_hwaccel_args(self.hwaccel), "-i", self.url,
-               "-an", "-vf", f"fps={self.fps}",
+               # OCR output: audio-less, low-fps PNG frames on stdout.
+               "-map", "0:v", "-an", "-vf", f"fps={self.fps}",
                "-f", "image2pipe", "-c:v", "png", "pipe:1"]
+        if self.buffer_dir:
+            self._prepare_buffer_dir()
+            cmd += [
+                # Replay ring: stream-copy (no re-encode) video+audio into a
+                # cyclic set of .ts segments. reset_timestamps keeps each segment
+                # self-contained so they concat cleanly later.
+                "-map", "0:v", "-map", "0:a?", "-c", "copy",
+                "-f", "segment", "-segment_time", str(self.segment_time),
+                "-segment_wrap", str(self._segment_wrap),
+                "-reset_timestamps", "1",
+                os.path.join(self.buffer_dir, "seg_%05d.ts"),
+            ]
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL, bufsize=0)
         self._running = True
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
         return self
+
+    def _prepare_buffer_dir(self) -> None:
+        """Create the ring dir and drop any leftovers from a prior session."""
+        os.makedirs(self.buffer_dir, exist_ok=True)
+        for old in glob.glob(os.path.join(self.buffer_dir, "seg_*.ts")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        for old in glob.glob(os.path.join(self.buffer_dir, "clip-*")):
+            shutil.rmtree(old, ignore_errors=True)
+
+    def snapshot(self, seconds: float) -> tuple[str, str] | None:
+        """Copy the most recent ~`seconds` of buffered segments to a fresh temp
+        dir and write an ffmpeg concat list for them. Returns (concat_file,
+        temp_dir) — caller re-encodes from the list and removes temp_dir — or
+        None if the ring is empty / no buffer configured.
+
+        Segments are copied (not referenced) so the recorder's segment_wrap can
+        keep overwriting the ring without corrupting an in-flight clip. The
+        newest segment (still being written) is skipped.
+        """
+        if not self.buffer_dir:
+            return None
+        entries = []
+        for p in glob.glob(os.path.join(self.buffer_dir, "seg_*.ts")):
+            try:
+                entries.append((os.path.getmtime(p), p))
+            except OSError:
+                pass
+        entries.sort()
+        segs = [p for _, p in entries][:-1]  # drop the in-progress newest
+        if not segs:
+            return None
+        k = max(1, math.ceil(seconds / self.segment_time))
+        chosen = segs[-k:]
+        # Work dir lives inside buffer_dir so the copy + re-encode stay on the
+        # same tmpfs as the ring (all in RAM); seg_*.ts globbing ignores it.
+        tmpdir = tempfile.mkdtemp(prefix="clip-", dir=self.buffer_dir)
+        listed = []
+        for i, src in enumerate(chosen):
+            dst = os.path.join(tmpdir, f"part_{i:05d}.ts")
+            try:
+                shutil.copy(src, dst)
+            except OSError:
+                continue  # segment got recycled mid-copy; skip it
+            listed.append(dst)
+        if not listed:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None
+        concat = os.path.join(tmpdir, "concat.txt")
+        with open(concat, "w") as f:
+            for p in listed:
+                f.write(f"file '{p}'\n")
+        return concat, tmpdir
 
     def _reader(self) -> None:
         stream = self._proc.stdout

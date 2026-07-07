@@ -19,6 +19,17 @@ services:
     environment:
       USE_CUDA: "1"
       NVIDIA_DRIVER_CAPABILITIES: all
+      # Post a short replay video to Discord on each goal. The ring buffer lives
+      # on the tmpfs mounted below (in RAM — no disk writes). CLIP_NVENC=1 would
+      # encode on the GPU; left off since libx264 (CPU) handles one 90s clip per
+      # goal fine. See .env.example for CLIP_SECONDS / CLIP_MAX_MB / etc.
+      CLIP_ENABLE: "1"
+      CLIP_BUFFER_DIR: /buf
+    # Ring buffer + clip re-encode stay entirely in RAM (no disk hammering). The
+    # ring is ~3x the clip length of stream-copied HEVC (~1 MB/s); size is just a
+    # ceiling (unused RAM isn't consumed), 512m leaves headroom for longer clips.
+    tmpfs:
+      - /buf:size=512m
     # Reserve all GPUs (equivalent to `docker run --gpus all`).
     deploy:
       resources:

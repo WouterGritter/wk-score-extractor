@@ -32,7 +32,8 @@ HDHomeRun ──ffmpeg──> frame ──ScoreReader──> ScoreResult ──S
 | `capture.py` | `grab_frame` (one-shot) + `StreamGrabber` (persistent). |
 | `hdhomerun.py` | Lineup discovery, channel→URL resolution (stdlib urllib). |
 | `aggregator.py` | `ScoreTracker` temporal state machine + `format_event`. |
-| `notifier.py` | Discord webhook POST (stdlib). |
+| `notifier.py` | Discord webhook POST + multipart file upload (stdlib). |
+| `clipper.py` | Cut a goal replay from the ring buffer → re-encode → upload. |
 | `monitor.py` | CLI, `.env` load, IDLE/ACTIVE polling loop, `--analyze`/`--test`. |
 
 ## Key decisions & why
@@ -183,6 +184,54 @@ fixes:
   rebuild): **lower `--fps` to 1–2.** With `confirm x2`, 1 fps confirms a score in
   ~2 s. This cuts python's rate ~4× and ffmpeg's PNG-encode share, but NOT ffmpeg's
   decode (that's what NVDEC is for). Do the fps change first, then NVDEC if needed.
+
+## Goal-replay clips
+
+On each confirmed goal, post a short replay video to Discord as a **follow-up
+message** (the text alert fires first, unchanged; the video lands a bit later
+after encode + upload). Off by default in code (`--clip` / `CLIP_ENABLE=1`); the
+**compose files enable it** and mount the tmpfs it needs. Validated end-to-end on
+real live goals (one tuner, real Discord upload). Default clip is ~30 s (25 s
+before detection + 5 s post-roll) at 720p.
+
+- **One tuner, no extra decode.** The ring is a **second output on the existing
+  `StreamGrabber` ffmpeg**: `-map 0:v -map 0:a? -c copy -f segment` writes
+  keyframe-aligned `.ts` segments (`-segment_wrap` bounds the footprint). It's a
+  packet remux — near-zero CPU on top of the decode OCR already pays. The OCR
+  output (`-an -vf fps=N` PNG pipe) is unchanged. The ring only exists while
+  ACTIVE, which is exactly when goals happen.
+- **Buffer wants audio; OCR doesn't.** That's why they're separate ffmpeg outputs
+  (OCR path is `-an` + filtered fps; ring is full copy incl. `0:a?`). `0:a?` makes
+  audio optional so a rare audio-less stream still yields a (silent) clip.
+- **All in RAM.** `buffer_dir` is a tmpfs (`/buf`, mounted 512m by compose; bare
+  `docker run` needs `--tmpfs /buf` or it falls back to overlayfs). `snapshot()`
+  copies the chosen segments into a work dir **inside** `buffer_dir` so the copy +
+  re-encode never touch disk. Answers the original "without hammering the disk":
+  ring is copy-only ~1 MB/s in RAM, one ~9 MB mp4 leaves RAM per goal.
+- **`snapshot(seconds)`** picks the most recent `ceil(seconds/segment_time)`
+  segments by mtime, **drops the newest** (still being written by the muxer), and
+  **copies** them out (not hardlink/reference — the muxer truncates-in-place on
+  wrap, which would corrupt a shared inode). Ring holds `clip_seconds*3` so a slow
+  encode can't race the wrap. Returns an ffmpeg concat-demuxer list.
+- **Re-encode is mandatory, not just for size.** Discord only renders an inline
+  player for **H.264/AAC mp4**; HEVC-in-mp4 usually won't preview. `clipper.encode_clip`
+  downscales (`scale=-2:<CLIP_HEIGHT>`, default 720) + `-movflags +faststart`.
+  `auto_bitrates` sizes the video bitrate to `CLIP_MAX_MB` so the clip fits a 10 MB
+  cap (a short 30s clip leaves plenty of bitrate headroom) and a boosted server
+  (25/100 MB) gets a proportionally sharper clip — no fixed guess to outgrow.
+- **NVENC optional** (`CLIP_NVENC=1` → `h264_nvenc`): the P4 has an encoder and the
+  `video` capability is already set, but libx264 (CPU) handles one short clip per goal
+  fine, so it's off by default (an nvenc-less ffmpeg build would error).
+- **Timing / post-roll.** Detection already lags the goal by seconds (scorebug
+  update + confirm-K), and the goal action sits inside the trailing buffer
+  (default 25s before detection). `CLIP_POSTROLL` (default 5s) waits *after*
+  detection before cutting so the clip also catches the on-screen celebration.
+- **Off the OCR loop.** The whole cut→encode→upload runs in a **daemon thread**
+  per goal (spawned only for real goals, `not event.is_first`, when a grabber
+  exists); it swallows all exceptions so a clip failure never touches the monitor.
+- **Upload is stdlib multipart** (`DiscordNotifier.send_file`): a `payload_json`
+  field + the file as `files[0]`. It skips (warns, doesn't send) if the file is
+  over `max_bytes`, so a mis-sized clip can't 413.
 
 ## Future: EPG gating (parked)
 

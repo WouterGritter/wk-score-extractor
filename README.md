@@ -19,6 +19,10 @@ from an HDHomeRun) and send a Discord message when the score changes.
   stays monotonic within a match (ignores halftime-highlight replays), emits on
   first sighting (incl. 0-0) and every confirmed change; resets between matches.
 - [x] **Discord webhook** — `notifier.py`: posts a message on every event.
+- [x] **Goal-replay clips** — `clipper.py`: on each goal, cut ~30 s (25 s before
+  + 5 s after) from an in-RAM ring buffer (same tuner, stream-copied — no extra
+  decode), re-encode to 720p, and post it to Discord as a follow-up video.
+  Validated live on NPO 1.
 - [ ] EPG gating (skip OCR / release tuner when no football is scheduled) —
   *parked*; the IDLE 1-min baseline always runs for now.
 
@@ -77,6 +81,21 @@ This builds `Dockerfile.cpu` (plain `onnxruntime`, no CUDA).
 Tuning: `--confirm K` (reads to confirm a change, default 2), `--fps` (ACTIVE
 stream rate, default 4), `--seek` (IDLE HEVC sync), `--heartbeat` (ACTIVE status
 log interval, min; 0 disables).
+
+### Goal-replay clips
+
+With `--clip` (or `CLIP_ENABLE=1`), each goal also posts a short **replay video**
+to Discord as a follow-up message. The ACTIVE ffmpeg gets a second output that
+stream-copies the broadcast into a rolling ring of `.ts` segments on a **tmpfs
+(RAM)** — one tuner, no extra decode, no disk writes. On a goal the monitor waits
+`--clip-postroll` s (default 5, to catch the celebration), cuts the last
+`--clip-seconds` (default 25) from the ring, re-encodes it to 720p (H.264/AAC mp4
+so Discord shows an inline player), and uploads it off the OCR thread.
+
+`--clip-bitrate auto` (default) sizes the bitrate to `--clip-max-mb` (default 10,
+Discord's non-boosted cap; raise to 25/100 on a boosted server) so the clip always
+fits. `--clip-nvenc` (or `CLIP_NVENC=1`) encodes on the GPU. Both compose files
+**enable clips by default** and mount the tmpfs; see `.env.example` for all knobs.
 
 ### HDHomeRun
 
@@ -141,7 +160,8 @@ screen (e.g. 1-0 @05:08 at real-time 66 min), and `aggregator.py` filters it out
 | `capture.py` | Grab one frame from a stream via ffmpeg |
 | `hdhomerun.py` | Discover channels / resolve stream URLs |
 | `aggregator.py` | Temporal state machine: confirmed score changes |
-| `notifier.py` | Discord webhook sender |
+| `notifier.py` | Discord webhook sender (messages + file uploads) |
+| `clipper.py` | Goal-replay clip: snapshot ring buffer → re-encode → upload |
 | `monitor.py` | Live poll loop + `--analyze` dry run; logs + notifies |
 
 ### Extracting test frames from a recording (fast, no full read)

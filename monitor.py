@@ -13,10 +13,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 import time
 
 from aggregator import ScoreTracker, format_event
 from capture import CaptureError, StreamGrabber, grab_frame
+from clipper import build_and_send_clip
 from hdhomerun import resolve_url
 from notifier import DiscordNotifier
 from reader_rapidocr import RapidOcrScoreReader
@@ -52,6 +54,22 @@ def hwaccel_enabled(args) -> bool:
     return bool(args.hwaccel) or _truthy(os.environ.get("FFMPEG_HWACCEL", ""))
 
 
+def clip_enabled(args) -> bool:
+    """Goal-replay clips on if --clip is passed or CLIP_ENABLE is truthy."""
+    return bool(args.clip) or _truthy(os.environ.get("CLIP_ENABLE", ""))
+
+
+def clip_nvenc_enabled(args) -> bool:
+    """Encode clips on the GPU (h264_nvenc) if --clip-nvenc or CLIP_NVENC."""
+    return bool(args.clip_nvenc) or _truthy(os.environ.get("CLIP_NVENC", ""))
+
+
+def _env_or(name: str, fallback):
+    """Env var wins over the argparse default (env/.env are read after parse)."""
+    val = os.environ.get(name)
+    return val if val not in (None, "") else fallback
+
+
 def analyze(paths: list[str], use_cuda: bool = False) -> None:
     """Dry run: read the score from local image file(s) and print results."""
     reader = RapidOcrScoreReader(use_cuda=use_cuda)
@@ -72,6 +90,26 @@ def run_live(args) -> None:
     idle_interval = args.interval
     timeout_s = args.timeout * 60.0
     heartbeat_s = args.heartbeat * 60.0
+
+    # --- goal-replay clip config (env overrides the argparse defaults) ---
+    clips = clip_enabled(args)
+    clip_seconds = float(_env_or("CLIP_SECONDS", args.clip_seconds))
+    clip_postroll = float(_env_or("CLIP_POSTROLL", args.clip_postroll))
+    clip_height = int(_env_or("CLIP_HEIGHT", args.clip_height))
+    clip_bitrate = str(_env_or("CLIP_BITRATE", args.clip_bitrate))
+    clip_max_bytes = int(float(_env_or("CLIP_MAX_MB", args.clip_max_mb)) * 1024 * 1024)
+    clip_nvenc = clip_nvenc_enabled(args)
+    buffer_dir = _env_or("CLIP_BUFFER_DIR", args.clip_buffer_dir)
+
+    grabber_kwargs = {"fps": args.fps, "hwaccel": hwaccel}
+    if clips:
+        grabber_kwargs["buffer_dir"] = buffer_dir
+        # Keep ~3x the clip length in the ring so a slow encode never races the
+        # segment_wrap overwriting the segments a snapshot is copying out.
+        grabber_kwargs["buffer_seconds"] = clip_seconds * 3
+        log.info("goal clips ON: last %.0fs, +%.0fs post-roll, %dp @%s, "
+                 "nvenc=%s, buffer=%s", clip_seconds, clip_postroll,
+                 clip_height, clip_bitrate, clip_nvenc, buffer_dir)
 
     active = False
     last_activity = 0.0
@@ -95,8 +133,7 @@ def run_live(args) -> None:
                         log.warning("stream ended — restarting")
                         if grabber:
                             grabber.stop()
-                        grabber = StreamGrabber(url, fps=args.fps,
-                                                hwaccel=hwaccel).start()
+                        grabber = StreamGrabber(url, **grabber_kwargs).start()
                         last_seq = 0
                     frame, last_seq = grabber.read(timeout=20.0, after_seq=last_seq)
                 else:
@@ -114,14 +151,27 @@ def run_live(args) -> None:
                     msg = format_event(event)
                     log.info("%s", msg)
                     notifier.send(msg)
+                    # A real goal (not the first-sighting "start" event) with a
+                    # running ring buffer: cut + post a replay off-thread so the
+                    # OCR loop keeps going while ffmpeg re-encodes and uploads.
+                    if clips and grabber is not None and not event.is_first:
+                        threading.Thread(
+                            target=build_and_send_clip,
+                            args=(grabber, notifier, event),
+                            kwargs=dict(seconds=clip_seconds,
+                                        postroll=clip_postroll,
+                                        height=clip_height,
+                                        vbitrate=(None if clip_bitrate in ("", "auto")
+                                                  else clip_bitrate),
+                                        nvenc=clip_nvenc, max_bytes=clip_max_bytes),
+                            daemon=True).start()
 
                 now = time.monotonic()
                 if result.present and not active:
                     active = True
                     last_activity = now
                     last_heartbeat = now
-                    grabber = StreamGrabber(url, fps=args.fps,
-                                            hwaccel=hwaccel).start()
+                    grabber = StreamGrabber(url, **grabber_kwargs).start()
                     last_seq = 0
                     log.info("scorebug detected -> ACTIVE (persistent stream)")
                 if result.score is not None:
@@ -176,6 +226,26 @@ def main() -> None:
     ap.add_argument("--hwaccel", action="store_true",
                     help="decode on GPU via NVDEC (or set FFMPEG_HWACCEL=1); "
                          "needs cuda-enabled ffmpeg + the NVIDIA 'video' capability")
+    ap.add_argument("--clip", action="store_true",
+                    help="on each goal, post a short replay video (or CLIP_ENABLE=1)")
+    ap.add_argument("--clip-seconds", type=float, default=25.0,
+                    help="replay clip length in seconds before the goal (default 25)")
+    ap.add_argument("--clip-postroll", type=float, default=5.0,
+                    help="seconds to wait after a goal before cutting the clip, "
+                         "so it catches the celebration (default 5)")
+    ap.add_argument("--clip-height", type=int, default=720,
+                    help="replay clip height in px, width auto (default 720)")
+    ap.add_argument("--clip-bitrate", default="auto",
+                    help="replay clip video bitrate; 'auto' sizes it to the cap "
+                         "so the clip always fits (default auto)")
+    ap.add_argument("--clip-max-mb", type=float, default=10.0,
+                    help="skip upload if the clip exceeds this many MB "
+                         "(Discord cap: 10 non-boosted, 25/100 boosted)")
+    ap.add_argument("--clip-nvenc", action="store_true",
+                    help="encode clips on GPU via h264_nvenc (or CLIP_NVENC=1)")
+    ap.add_argument("--clip-buffer-dir", default="/dev/shm/wk-score-buffer",
+                    help="ring-buffer dir for replay segments; put it on a tmpfs "
+                         "(default /dev/shm/wk-score-buffer)")
     ap.add_argument("--verbose", action="store_true", help="log every frame read")
     ap.add_argument("--test", action="store_true",
                     help="send a Discord test message and exit")
