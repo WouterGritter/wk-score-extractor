@@ -54,6 +54,15 @@ HDHomeRun ──ffmpeg──> frame ──ScoreReader──> ScoreResult ──S
   renders partially — one team code missing + a misread digit. The "9" misread
   *recurs*, so it can appear twice and defeat confirm-K. Fix: a stable scorebug
   always shows **both** team codes, so ignore any read with a missing team.
+- **Confirm on the full signature, not just the score.** A goal fires a scorebug
+  **animation** that keeps the score right but briefly *misreads a present team
+  code* (`USA`→`OUS`, `USA`→`OUS`… → the `USA 0-1 BEL` goal posted as `OUS 0-1
+  BEL`). So the confirm-K candidate is `(score, home_team, away_team)`: it only
+  advances while all three are stable, and the emitted event uses the *stable*
+  candidate's teams — not a per-frame latch (that latch was how the misread
+  leaked). Teams are set on the tracker only at confirmation. Residual edge: a
+  team misread that *recurs* for K consecutive frames still commits (same class as
+  the recurring-"9" digit blip); lever is a higher `confirm_k`, left at 2.
 
 ## The scorebug
 
